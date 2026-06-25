@@ -2,7 +2,7 @@ name: Build and Push Image
 
 on:
   push:
-    branches: ["main"]
+    branches: [main]
 
 permissions:
   id-token: write
@@ -27,6 +27,7 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ARN_ROLE }}
           aws-region: ${{ env.AWS_REGION }}
           audience: sts.amazonaws.com
+          disable-session-tagging: true
 
       - name: Login to Amazon ECR
         id: login-ecr
