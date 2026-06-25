@@ -1,4 +1,4 @@
-name: Build, Push, and Deploy Image
+name: Build, Push, Scan, and Deploy Image
 
 on:
   push:
@@ -32,15 +32,6 @@ jobs:
           disable-session-tagging: true
           role-session-name: github-actions-session
 
-      - name: Get and decode OIDC token
-        id: oidc_debug
-        run: |
-          ID_TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r '.value')
-          
-          echo "Decoded token claims:"
-          echo $ID_TOKEN | cut -d. -f2 | base64 -d 2>/dev/null | jq .
-
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
@@ -52,45 +43,78 @@ jobs:
       - name: Tag Docker Image
         id: tag
         run: |
-          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-          IMAGE_TAG="${TIMESTAMP}-${GITHUB_SHA::7}"
+          IMAGE_TAG="${GITHUB_SHA::7}"
           echo "image-tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
           
           docker tag ${{ secrets.ECR_REPO_NAME }}:latest \
-            ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPO_NAME }}:latest
+            ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPO_NAME }}:$IMAGE_TAG
           
           docker tag ${{ secrets.ECR_REPO_NAME }}:latest \
-            ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPO_NAME }}:$IMAGE_TAG
+            ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPO_NAME }}:latest
 
       - name: Push Docker Image
         run: |
           docker push ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPO_NAME }}:latest
           docker push ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPO_NAME }}:${{ steps.tag.outputs.image-tag }}
 
-  deploy-to-ec2:
+  scan:
     needs: build-and-push
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
-    
     steps:
-      - name: Deploy to EC2
-        uses: appleboy/ssh-action@v1.0.3
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USERNAME }}
-          key: ${{ secrets.EC2_SSH_KEY }}
-          script: |
-            # Pull the latest image
-            aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ needs.build-and-push.outputs.registry }}
-            docker pull ${{ needs.build-and-push.outputs.registry }}/${{ secrets.ECR_REPO_NAME }}:latest
-            
-            # Stop and remove old container
-            docker stop ${{ secrets.ECR_REPO_NAME }} || true
-            docker rm ${{ secrets.ECR_REPO_NAME }} || true
-            
-            # Run new container
-            docker run -d \
-              --name ${{ secrets.ECR_REPO_NAME }} \
-              --restart always \
-              -p 80:80 \
-              ${{ needs.build-and-push.outputs.registry }}/${{ secrets.ECR_REPO_NAME }}:latest
+          role-to-assume: ${{ secrets.AWS_ARN_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+          disable-session-tagging: true
+          role-session-name: github-actions-session
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPO_NAME }}:${{ needs.build-and-push.outputs.image-tag }}
+          format: table
+          exit-code: '0'
+          severity: CRITICAL,HIGH
+
+  deploy-ecs:
+    needs: scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ARN_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+          disable-session-tagging: true
+          role-session-name: github-actions-session
+
+      - name: Deploy to ECS
+        run: |
+          echo "Updating ECS service to use the new image..."
+          
+          aws ecs update-service \
+            --cluster ${{ secrets.ECS_CLUSTER }} \
+            --service ${{ secrets.ECS_SERVICE }} \
+            --force-new-deployment
+          
+          echo "Waiting for deployment to stabilize..."
+          aws ecs wait services-stable \
+            --cluster ${{ secrets.ECS_CLUSTER }} \
+            --services ${{ secrets.ECS_SERVICE }}
+          
+          echo "Deployment completed successfully!"
+
+      - name: Get deployment status
+        run: |
+          aws ecs describe-services \
+            --cluster ${{ secrets.ECS_CLUSTER }} \
+            --services ${{ secrets.ECS_SERVICE }} \
+            --query 'services[0].deployments' \
+            --output table
