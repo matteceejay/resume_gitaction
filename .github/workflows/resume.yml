@@ -1,4 +1,4 @@
-name: Build and Push Image
+name: Build, Push, and Deploy Image
 
 on:
   push:
@@ -13,8 +13,11 @@ env:
   ECR_REPOSITORY: ${{ secrets.ECR_REPO_NAME }}
 
 jobs:
-  build:
+  build-and-push:
     runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.tag.outputs.image-tag }}
+      registry: ${{ steps.login-ecr.outputs.registry }}
 
     steps:
       - name: Checkout Code
@@ -26,7 +29,7 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ARN_ROLE }}
           aws-region: ${{ env.AWS_REGION }}
           audience: sts.amazonaws.com
-          disable-session-tagging: true  # Fixed: was disable-session-tags
+          disable-session-tagging: true
           role-session-name: github-actions-session
 
       - name: Get and decode OIDC token
@@ -47,11 +50,47 @@ jobs:
           docker build -t ${{ secrets.ECR_REPO_NAME }} .
 
       - name: Tag Docker Image
+        id: tag
         run: |
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          IMAGE_TAG="${TIMESTAMP}-${GITHUB_SHA::7}"
+          echo "image-tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          
           docker tag ${{ secrets.ECR_REPO_NAME }}:latest \
             ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPO_NAME }}:latest
+          
+          docker tag ${{ secrets.ECR_REPO_NAME }}:latest \
+            ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPO_NAME }}:$IMAGE_TAG
 
       - name: Push Docker Image
         run: |
-          docker push \
-            ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPO_NAME }}:latest
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPO_NAME }}:latest
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPO_NAME }}:${{ steps.tag.outputs.image-tag }}
+
+  deploy-to-ec2:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            # Pull the latest image
+            aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ needs.build-and-push.outputs.registry }}
+            docker pull ${{ needs.build-and-push.outputs.registry }}/${{ secrets.ECR_REPO_NAME }}:latest
+            
+            # Stop and remove old container
+            docker stop ${{ secrets.ECR_REPO_NAME }} || true
+            docker rm ${{ secrets.ECR_REPO_NAME }} || true
+            
+            # Run new container
+            docker run -d \
+              --name ${{ secrets.ECR_REPO_NAME }} \
+              --restart always \
+              -p 80:80 \
+              ${{ needs.build-and-push.outputs.registry }}/${{ secrets.ECR_REPO_NAME }}:latest
